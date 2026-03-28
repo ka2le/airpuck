@@ -2,11 +2,10 @@ import Phaser from 'phaser';
 import './style.css';
 
 type Vec2 = { x: number; y: number };
-
-type PaddleId = 'left' | 'right';
+type Side = 'left' | 'right' | 'top' | 'bottom';
 
 type PaddleState = {
-  id: PaddleId;
+  id: 'a' | 'b';
   body: Phaser.GameObjects.Arc;
   glow: Phaser.GameObjects.Arc;
   vx: number;
@@ -14,7 +13,6 @@ type PaddleState = {
   touchId: number | null;
   homeX: number;
   homeY: number;
-  half: PaddleId;
   grabOffsetX: number;
   grabOffsetY: number;
   lastTargetX: number;
@@ -22,8 +20,8 @@ type PaddleState = {
 };
 
 type ScoreState = {
-  left: number;
-  right: number;
+  a: number;
+  b: number;
 };
 
 type FireworkParticle = {
@@ -37,14 +35,22 @@ type FireworkParticle = {
   size: number;
 };
 
-const WORLD = {
-  width: 1920,
-  height: 1080,
-  inset: 56,
-  goalWidth: 300,
-  goalDepth: 28,
-  paddleRadius: 86,
-  puckRadius: 40,
+type Layout = {
+  width: number;
+  height: number;
+  inset: number;
+  goalLength: number;
+  goalDepth: number;
+  paddleRadius: number;
+  puckRadius: number;
+  centerX: number;
+  centerY: number;
+  divideVertical: boolean;
+  playerASide: Side;
+  playerBSide: Side;
+};
+
+const TUNING = {
   maxTouches: 2,
   drag: 0.00008,
   wallDamping: 0.92,
@@ -54,7 +60,7 @@ const WORLD = {
   paddleSpeedClamp: 3400,
   puckMinSpeed: 320,
   puckMaxSpeed: 3000,
-  puckServeSpeed: 980,
+  puckServeSpeedFactor: 0.95,
   goalPauseMs: 1350,
   touchSmoothing: 0.34,
 };
@@ -66,8 +72,8 @@ class AirpuckScene extends Phaser.Scene {
   private puckGlow!: Phaser.GameObjects.Arc;
   private puckTrail!: Phaser.GameObjects.Graphics;
   private fireworksGraphics!: Phaser.GameObjects.Graphics;
-  private paddles!: Record<PaddleId, PaddleState>;
-  private score: ScoreState = { left: 0, right: 0 };
+  private paddles!: Record<'a' | 'b', PaddleState>;
+  private score: ScoreState = { a: 0, b: 0 };
   private scoreText!: Phaser.GameObjects.Text;
   private subtitleText!: Phaser.GameObjects.Text;
   private menuContainer!: Phaser.GameObjects.Container;
@@ -78,6 +84,7 @@ class AirpuckScene extends Phaser.Scene {
   private puckVelocity: Vec2 = { x: 0, y: 0 };
   private puckLastPositions: Vec2[] = [];
   private fireworks: FireworkParticle[] = [];
+  private layout: Layout = this.makeLayout(window.innerWidth || 1280, window.innerHeight || 720);
 
   constructor() {
     super('airpuck');
@@ -91,23 +98,40 @@ class AirpuckScene extends Phaser.Scene {
     this.createUi();
     this.registerInput();
     this.scale.on('resize', this.handleResize, this);
-    this.handleResize();
-    this.resetRound(Phaser.Math.Between(0, 1) === 0 ? 'left' : 'right');
+    this.relayout(this.scale.width, this.scale.height);
+    this.resetRound(Phaser.Math.Between(0, 1) === 0 ? 'a' : 'b');
+  }
+
+  private makeLayout(width: number, height: number): Layout {
+    const safeWidth = Math.max(width, 320);
+    const safeHeight = Math.max(height, 320);
+    const shortSide = Math.min(safeWidth, safeHeight);
+    const inset = Math.max(18, Math.round(shortSide * 0.05));
+    const goalLength = Math.round(shortSide * 0.28);
+    const goalDepth = Math.max(18, Math.round(shortSide * 0.026));
+    const paddleRadius = Math.max(38, Math.round(shortSide * 0.08));
+    const puckRadius = Math.max(18, Math.round(shortSide * 0.036));
+    const divideVertical = safeWidth >= safeHeight;
+
+    return {
+      width: safeWidth,
+      height: safeHeight,
+      inset,
+      goalLength,
+      goalDepth,
+      paddleRadius,
+      puckRadius,
+      centerX: safeWidth / 2,
+      centerY: safeHeight / 2,
+      divideVertical,
+      playerASide: divideVertical ? 'left' : 'top',
+      playerBSide: divideVertical ? 'right' : 'bottom',
+    };
   }
 
   private createBackdrop() {
     for (let i = 0; i < 120; i += 1) {
-      const star = this.add.circle(
-        Phaser.Math.Between(0, WORLD.width),
-        Phaser.Math.Between(0, WORLD.height),
-        Phaser.Math.FloatBetween(1, 3),
-        Phaser.Display.Color.GetColor(
-          Phaser.Math.Between(180, 255),
-          Phaser.Math.Between(180, 255),
-          255,
-        ),
-        Phaser.Math.FloatBetween(0.25, 0.85),
-      );
+      const star = this.add.circle(0, 0, Phaser.Math.FloatBetween(1, 3), 0xffffff, Phaser.Math.FloatBetween(0.25, 0.85));
       this.stars.push(star);
     }
   }
@@ -119,40 +143,39 @@ class AirpuckScene extends Phaser.Scene {
   }
 
   private createEntities() {
-    this.puckGlow = this.add.circle(WORLD.width / 2, WORLD.height / 2, WORLD.puckRadius * 2.2, 0x66ccff, 0.12);
-    this.puck = this.add.circle(WORLD.width / 2, WORLD.height / 2, WORLD.puckRadius, 0xe8f7ff, 1);
+    this.puckGlow = this.add.circle(0, 0, 20, 0x66ccff, 0.12);
+    this.puck = this.add.circle(0, 0, 10, 0xe8f7ff, 1);
 
     this.paddles = {
-      left: this.createPaddle('left', 320, WORLD.height / 2, 0xff6bd6),
-      right: this.createPaddle('right', WORLD.width - 320, WORLD.height / 2, 0x69f0ff),
+      a: this.createPaddle(0xff6bd6),
+      b: this.createPaddle(0x69f0ff),
     };
   }
 
-  private createPaddle(id: PaddleId, x: number, y: number, color: number): PaddleState {
-    const glow = this.add.circle(x, y, WORLD.paddleRadius * 1.45, color, 0.15);
-    const body = this.add.circle(x, y, WORLD.paddleRadius, color, 1);
+  private createPaddle(color: number): PaddleState {
+    const glow = this.add.circle(0, 0, 40, color, 0.15);
+    const body = this.add.circle(0, 0, 20, color, 1);
     body.setStrokeStyle(6, 0xffffff, 0.7);
 
     return {
-      id,
+      id: color === 0xff6bd6 ? 'a' : 'b',
       body,
       glow,
       vx: 0,
       vy: 0,
       touchId: null,
-      homeX: x,
-      homeY: y,
-      half: id,
+      homeX: 0,
+      homeY: 0,
       grabOffsetX: 0,
       grabOffsetY: 0,
-      lastTargetX: x,
-      lastTargetY: y,
+      lastTargetX: 0,
+      lastTargetY: 0,
     };
   }
 
   private createUi() {
     this.scoreText = this.add
-      .text(WORLD.width / 2, WORLD.height / 2, '0  :  0', {
+      .text(0, 0, '0 : 0', {
         fontFamily: 'Arial, Helvetica, sans-serif',
         fontSize: '72px',
         color: '#eaf6ff',
@@ -164,23 +187,23 @@ class AirpuckScene extends Phaser.Scene {
       .setInteractive({ useHandCursor: true });
 
     this.subtitleText = this.add
-      .text(WORLD.width / 2, WORLD.height / 2 + 86, 'Tap score to restart • Tap FULLSCREEN for mobile', {
+      .text(0, 0, 'Tap score to restart • Tap FULLSCREEN for mobile', {
         fontFamily: 'Arial, Helvetica, sans-serif',
         fontSize: '30px',
         color: '#8fb6d9',
       })
       .setOrigin(0.5);
 
-    this.fullscreenButton = this.makeMenuButton(WORLD.width / 2, WORLD.height - 86, 'FULLSCREEN', () => {
+    this.fullscreenButton = this.makeMenuButton(0, 0, 'FULLSCREEN', () => {
       void this.enterFullscreen();
     }, 340);
     this.fullscreenButton.setDepth(10);
 
-    const panel = this.add.rectangle(WORLD.width / 2, WORLD.height / 2, 560, 380, 0x081120, 0.92);
+    const panel = this.add.rectangle(0, 0, 560, 380, 0x081120, 0.92);
     panel.setStrokeStyle(4, 0x69f0ff, 0.6);
 
     const title = this.add
-      .text(WORLD.width / 2, WORLD.height / 2 - 110, 'Restart match?', {
+      .text(0, 0, 'Restart match?', {
         fontFamily: 'Arial, Helvetica, sans-serif',
         fontSize: '48px',
         color: '#f4fbff',
@@ -188,16 +211,16 @@ class AirpuckScene extends Phaser.Scene {
       })
       .setOrigin(0.5);
 
-    const restartBtn = this.makeMenuButton(WORLD.width / 2, WORLD.height / 2 + 10, 'Restart', () => {
-      this.score = { left: 0, right: 0 };
+    const restartBtn = this.makeMenuButton(0, 0, 'Restart', () => {
+      this.score = { a: 0, b: 0 };
       this.updateScoreText();
       this.toggleMenu(false);
       this.goalFreeze = false;
       this.fireworks = [];
-      this.resetRound('right');
+      this.resetRound('b');
     });
 
-    const closeBtn = this.makeMenuButton(WORLD.width / 2, WORLD.height / 2 + 110, 'Resume', () => {
+    const closeBtn = this.makeMenuButton(0, 0, 'Resume', () => {
       this.toggleMenu(false);
     });
 
@@ -235,7 +258,7 @@ class AirpuckScene extends Phaser.Scene {
 
   private onPointerDown(pointer: Phaser.Input.Pointer) {
     if (this.menuVisible || this.goalFreeze) return;
-    if (this.activePointerIds.size >= WORLD.maxTouches) return;
+    if (this.activePointerIds.size >= TUNING.maxTouches) return;
     if (this.activePointerIds.has(pointer.id)) return;
 
     const available = Object.values(this.paddles).filter((p) => p.touchId === null);
@@ -275,16 +298,16 @@ class AirpuckScene extends Phaser.Scene {
   private movePaddleToPointer(paddle: PaddleState, pointer: Phaser.Input.Pointer, dt: number, snap: boolean) {
     const rawTargetX = pointer.worldX + paddle.grabOffsetX;
     const rawTargetY = pointer.worldY + paddle.grabOffsetY;
-    const clamped = this.clampPaddlePosition(paddle, rawTargetX, rawTargetY);
+    const clamped = this.clampPaddlePosition(paddle.id, rawTargetX, rawTargetY);
     const target = snap
       ? clamped
       : {
-          x: Phaser.Math.Linear(paddle.lastTargetX, clamped.x, WORLD.touchSmoothing),
-          y: Phaser.Math.Linear(paddle.lastTargetY, clamped.y, WORLD.touchSmoothing),
+          x: Phaser.Math.Linear(paddle.lastTargetX, clamped.x, TUNING.touchSmoothing),
+          y: Phaser.Math.Linear(paddle.lastTargetY, clamped.y, TUNING.touchSmoothing),
         };
 
-    paddle.vx = Phaser.Math.Clamp((target.x - paddle.body.x) / dt, -WORLD.paddleSpeedClamp, WORLD.paddleSpeedClamp);
-    paddle.vy = Phaser.Math.Clamp((target.y - paddle.body.y) / dt, -WORLD.paddleSpeedClamp, WORLD.paddleSpeedClamp);
+    paddle.vx = Phaser.Math.Clamp((target.x - paddle.body.x) / dt, -TUNING.paddleSpeedClamp, TUNING.paddleSpeedClamp);
+    paddle.vy = Phaser.Math.Clamp((target.y - paddle.body.y) / dt, -TUNING.paddleSpeedClamp, TUNING.paddleSpeedClamp);
     paddle.body.setPosition(target.x, target.y);
     paddle.glow.setPosition(target.x, target.y);
     paddle.lastTargetX = target.x;
@@ -312,9 +335,9 @@ class AirpuckScene extends Phaser.Scene {
   private updatePaddles(dt: number) {
     Object.values(this.paddles).forEach((paddle) => {
       if (paddle.touchId === null) {
-        const target = this.clampPaddlePosition(paddle, paddle.homeX, paddle.homeY);
-        const nextX = Phaser.Math.Linear(paddle.body.x, target.x, WORLD.paddleReturnLerp);
-        const nextY = Phaser.Math.Linear(paddle.body.y, target.y, WORLD.paddleReturnLerp);
+        const target = { x: paddle.homeX, y: paddle.homeY };
+        const nextX = Phaser.Math.Linear(paddle.body.x, target.x, TUNING.paddleReturnLerp);
+        const nextY = Phaser.Math.Linear(paddle.body.y, target.y, TUNING.paddleReturnLerp);
         paddle.vx = (nextX - paddle.body.x) / Math.max(dt, 0.001);
         paddle.vy = (nextY - paddle.body.y) / Math.max(dt, 0.001);
         paddle.body.setPosition(nextX, nextY);
@@ -326,54 +349,79 @@ class AirpuckScene extends Phaser.Scene {
   }
 
   private updatePuck(dt: number) {
-    this.puckVelocity.x *= 1 - WORLD.drag * (dt * 1000);
-    this.puckVelocity.y *= 1 - WORLD.drag * (dt * 1000);
+    const speedFloor = Math.min(this.layout.width, this.layout.height) * 0.28;
+    const speedCeil = Math.min(this.layout.width, this.layout.height) * 2.5;
+
+    this.puckVelocity.x *= 1 - TUNING.drag * (dt * 1000);
+    this.puckVelocity.y *= 1 - TUNING.drag * (dt * 1000);
 
     let nextX = this.puck.x + this.puckVelocity.x * dt;
     let nextY = this.puck.y + this.puckVelocity.y * dt;
 
-    const left = WORLD.inset + WORLD.puckRadius;
-    const right = WORLD.width - WORLD.inset - WORLD.puckRadius;
-    const top = WORLD.inset + WORLD.puckRadius;
-    const bottom = WORLD.height - WORLD.inset - WORLD.puckRadius;
-    const goalTop = (WORLD.height - WORLD.goalWidth) / 2;
-    const goalBottom = goalTop + WORLD.goalWidth;
+    const l = this.layout;
+    const left = l.inset + l.puckRadius;
+    const right = l.width - l.inset - l.puckRadius;
+    const top = l.inset + l.puckRadius;
+    const bottom = l.height - l.inset - l.puckRadius;
 
-    const inLeftGoalMouth = nextY > goalTop && nextY < goalBottom && nextX - WORLD.puckRadius <= WORLD.inset + WORLD.goalDepth;
-    const inRightGoalMouth = nextY > goalTop && nextY < goalBottom && nextX + WORLD.puckRadius >= WORLD.width - WORLD.inset - WORLD.goalDepth;
+    if (l.divideVertical) {
+      const goalTop = l.centerY - l.goalLength / 2;
+      const goalBottom = l.centerY + l.goalLength / 2;
+      const inLeftGoalMouth = nextY > goalTop && nextY < goalBottom && nextX - l.puckRadius <= l.inset + l.goalDepth;
+      const inRightGoalMouth = nextY > goalTop && nextY < goalBottom && nextX + l.puckRadius >= l.width - l.inset - l.goalDepth;
 
-    if (!inLeftGoalMouth && nextX <= left) {
-      nextX = left;
-      this.puckVelocity.x *= -WORLD.wallDamping;
-      this.puckVelocity.y *= WORLD.wallDamping;
-    }
+      if (!inLeftGoalMouth && nextX <= left) {
+        nextX = left;
+        this.puckVelocity.x *= -TUNING.wallDamping;
+        this.puckVelocity.y *= TUNING.wallDamping;
+      }
+      if (!inRightGoalMouth && nextX >= right) {
+        nextX = right;
+        this.puckVelocity.x *= -TUNING.wallDamping;
+        this.puckVelocity.y *= TUNING.wallDamping;
+      }
+      if (nextY <= top || nextY >= bottom) {
+        nextY = Phaser.Math.Clamp(nextY, top, bottom);
+        this.puckVelocity.y *= -TUNING.wallDamping;
+        this.puckVelocity.x *= TUNING.wallDamping;
+      }
+    } else {
+      const goalLeft = l.centerX - l.goalLength / 2;
+      const goalRight = l.centerX + l.goalLength / 2;
+      const inTopGoalMouth = nextX > goalLeft && nextX < goalRight && nextY - l.puckRadius <= l.inset + l.goalDepth;
+      const inBottomGoalMouth = nextX > goalLeft && nextX < goalRight && nextY + l.puckRadius >= l.height - l.inset - l.goalDepth;
 
-    if (!inRightGoalMouth && nextX >= right) {
-      nextX = right;
-      this.puckVelocity.x *= -WORLD.wallDamping;
-      this.puckVelocity.y *= WORLD.wallDamping;
-    }
-
-    if (nextY <= top || nextY >= bottom) {
-      nextY = Phaser.Math.Clamp(nextY, top, bottom);
-      this.puckVelocity.y *= -WORLD.wallDamping;
-      this.puckVelocity.x *= WORLD.wallDamping;
+      if (!inTopGoalMouth && nextY <= top) {
+        nextY = top;
+        this.puckVelocity.y *= -TUNING.wallDamping;
+        this.puckVelocity.x *= TUNING.wallDamping;
+      }
+      if (!inBottomGoalMouth && nextY >= bottom) {
+        nextY = bottom;
+        this.puckVelocity.y *= -TUNING.wallDamping;
+        this.puckVelocity.x *= TUNING.wallDamping;
+      }
+      if (nextX <= left || nextX >= right) {
+        nextX = Phaser.Math.Clamp(nextX, left, right);
+        this.puckVelocity.x *= -TUNING.wallDamping;
+        this.puckVelocity.y *= TUNING.wallDamping;
+      }
     }
 
     this.puck.setPosition(nextX, nextY);
     this.puckGlow.setPosition(nextX, nextY);
 
-    this.resolvePaddleCollision(this.paddles.left);
-    this.resolvePaddleCollision(this.paddles.right);
+    this.resolvePaddleCollision(this.paddles.a);
+    this.resolvePaddleCollision(this.paddles.b);
 
     const speed = Math.hypot(this.puckVelocity.x, this.puckVelocity.y);
-    if (speed < WORLD.puckMinSpeed && speed > 0) {
-      const scale = WORLD.puckMinSpeed / speed;
+    if (speed < speedFloor && speed > 0) {
+      const scale = speedFloor / speed;
       this.puckVelocity.x *= scale;
       this.puckVelocity.y *= scale;
     }
-    if (speed > WORLD.puckMaxSpeed) {
-      const scale = WORLD.puckMaxSpeed / speed;
+    if (speed > speedCeil) {
+      const scale = speedCeil / speed;
       this.puckVelocity.x *= scale;
       this.puckVelocity.y *= scale;
     }
@@ -383,10 +431,11 @@ class AirpuckScene extends Phaser.Scene {
   }
 
   private resolvePaddleCollision(paddle: PaddleState) {
+    const l = this.layout;
     const dx = this.puck.x - paddle.body.x;
     const dy = this.puck.y - paddle.body.y;
     const distance = Math.hypot(dx, dy);
-    const minDistance = WORLD.paddleRadius + WORLD.puckRadius;
+    const minDistance = l.paddleRadius + l.puckRadius;
     if (distance <= 0 || distance >= minDistance) return;
 
     const nx = dx / distance;
@@ -399,12 +448,11 @@ class AirpuckScene extends Phaser.Scene {
     const relativeVx = this.puckVelocity.x - paddle.vx;
     const relativeVy = this.puckVelocity.y - paddle.vy;
     const relativeAlongNormal = relativeVx * nx + relativeVy * ny;
-
     if (relativeAlongNormal > 0) return;
 
-    const bounce = -relativeAlongNormal * WORLD.paddleHitBoost;
-    this.puckVelocity.x += nx * bounce + paddle.vx * 0.22 * WORLD.paddleHitInfluence;
-    this.puckVelocity.y += ny * bounce + paddle.vy * 0.22 * WORLD.paddleHitInfluence;
+    const bounce = -relativeAlongNormal * TUNING.paddleHitBoost;
+    this.puckVelocity.x += nx * bounce + paddle.vx * 0.22 * TUNING.paddleHitInfluence;
+    this.puckVelocity.y += ny * bounce + paddle.vy * 0.22 * TUNING.paddleHitInfluence;
 
     const tangentX = -ny;
     const tangentY = nx;
@@ -424,7 +472,7 @@ class AirpuckScene extends Phaser.Scene {
     this.puckTrail.clear();
     this.puckLastPositions.forEach((pos, index) => {
       const alpha = 0.16 - index * 0.013;
-      const radius = WORLD.puckRadius * (0.78 - index * 0.045);
+      const radius = this.layout.puckRadius * (0.78 - index * 0.045);
       if (alpha > 0 && radius > 3) {
         this.puckTrail.fillStyle(0x7fd6ff, alpha);
         this.puckTrail.fillCircle(pos.x, pos.y, radius);
@@ -433,24 +481,42 @@ class AirpuckScene extends Phaser.Scene {
   }
 
   private checkGoal() {
-    const goalTop = (WORLD.height - WORLD.goalWidth) / 2;
-    const goalBottom = goalTop + WORLD.goalWidth;
-    const leftLine = WORLD.inset + WORLD.goalDepth;
-    const rightLine = WORLD.width - WORLD.inset - WORLD.goalDepth;
+    const l = this.layout;
 
-    if (this.puck.y > goalTop && this.puck.y < goalBottom && this.puck.x - WORLD.puckRadius <= leftLine) {
-      this.handleGoal('right');
+    if (l.divideVertical) {
+      const goalTop = l.centerY - l.goalLength / 2;
+      const goalBottom = l.centerY + l.goalLength / 2;
+      const leftLine = l.inset + l.goalDepth;
+      const rightLine = l.width - l.inset - l.goalDepth;
+
+      if (this.puck.y > goalTop && this.puck.y < goalBottom && this.puck.x - l.puckRadius <= leftLine) {
+        this.handleGoal('b');
+        return;
+      }
+      if (this.puck.y > goalTop && this.puck.y < goalBottom && this.puck.x + l.puckRadius >= rightLine) {
+        this.handleGoal('a');
+      }
       return;
     }
 
-    if (this.puck.y > goalTop && this.puck.y < goalBottom && this.puck.x + WORLD.puckRadius >= rightLine) {
-      this.handleGoal('left');
+    const goalLeft = l.centerX - l.goalLength / 2;
+    const goalRight = l.centerX + l.goalLength / 2;
+    const topLine = l.inset + l.goalDepth;
+    const bottomLine = l.height - l.inset - l.goalDepth;
+
+    if (this.puck.x > goalLeft && this.puck.x < goalRight && this.puck.y - l.puckRadius <= topLine) {
+      this.handleGoal('b');
+      return;
+    }
+    if (this.puck.x > goalLeft && this.puck.x < goalRight && this.puck.y + l.puckRadius >= bottomLine) {
+      this.handleGoal('a');
     }
   }
 
-  private handleGoal(scoringSide: PaddleId) {
+  private handleGoal(scoringPlayer: 'a' | 'b') {
     if (this.goalFreeze) return;
 
+    const l = this.layout;
     this.goalFreeze = true;
     this.activePointerIds.clear();
     Object.values(this.paddles).forEach((paddle) => {
@@ -459,22 +525,24 @@ class AirpuckScene extends Phaser.Scene {
       paddle.grabOffsetY = 0;
     });
 
-    if (scoringSide === 'left') {
-      this.score.left += 1;
-      this.spawnFireworks(WORLD.inset + WORLD.goalDepth + 70, WORLD.height / 2, 0xff6bd6);
+    this.score[scoringPlayer] += 1;
+
+    if (l.divideVertical) {
+      const x = scoringPlayer === 'a' ? l.inset + l.goalDepth + 70 : l.width - l.inset - l.goalDepth - 70;
+      this.spawnFireworks(x, l.centerY, scoringPlayer === 'a' ? 0xff6bd6 : 0x69f0ff);
     } else {
-      this.score.right += 1;
-      this.spawnFireworks(WORLD.width - WORLD.inset - WORLD.goalDepth - 70, WORLD.height / 2, 0x69f0ff);
+      const y = scoringPlayer === 'a' ? l.inset + l.goalDepth + 70 : l.height - l.inset - l.goalDepth - 70;
+      this.spawnFireworks(l.centerX, y, scoringPlayer === 'a' ? 0xff6bd6 : 0x69f0ff);
     }
 
     this.updateScoreText();
     this.subtitleText.setText('GOAL! Cosmic fireworks...');
     this.puckVelocity = { x: 0, y: 0 };
 
-    this.time.delayedCall(WORLD.goalPauseMs, () => {
+    this.time.delayedCall(TUNING.goalPauseMs, () => {
       this.goalFreeze = false;
-      this.subtitleText.setText('Tap score to restart • Tap FULLSCREEN for mobile');
-      this.resetRound(scoringSide === 'left' ? 'right' : 'left');
+      this.subtitleText.setText(this.fullscreenButton.visible ? 'Tap score to restart • Tap FULLSCREEN for mobile' : 'Tap score to restart');
+      this.resetRound(scoringPlayer === 'a' ? 'b' : 'a');
     });
   }
 
@@ -523,76 +591,115 @@ class AirpuckScene extends Phaser.Scene {
   }
 
   private updateScoreText() {
-    this.scoreText.setText(`${this.score.left}  :  ${this.score.right}`);
+    this.scoreText.setText(`${this.score.a}  :  ${this.score.b}`);
   }
 
-  private resetRound(servingTo: PaddleId) {
-    this.puck.setPosition(WORLD.width / 2, WORLD.height / 2);
-    this.puckGlow.setPosition(WORLD.width / 2, WORLD.height / 2);
+  private resetRound(servingPlayer: 'a' | 'b') {
+    const l = this.layout;
+    const shortSide = Math.min(l.width, l.height);
+    const serveSpeed = shortSide * TUNING.puckServeSpeedFactor;
+
+    this.puck.setPosition(l.centerX, l.centerY);
+    this.puckGlow.setPosition(l.centerX, l.centerY);
     this.puckLastPositions = [];
-    const angleBase = servingTo === 'left' ? 0 : Math.PI;
+
+    let angleBase = 0;
+    if (l.divideVertical) {
+      angleBase = servingPlayer === 'a' ? 0 : Math.PI;
+    } else {
+      angleBase = servingPlayer === 'a' ? Math.PI / 2 : -Math.PI / 2;
+    }
+
     const angle = angleBase + Phaser.Math.FloatBetween(-0.35, 0.35);
     this.puckVelocity = {
-      x: Math.cos(angle) * WORLD.puckServeSpeed,
-      y: Math.sin(angle) * WORLD.puckServeSpeed,
+      x: Math.cos(angle) * serveSpeed,
+      y: Math.sin(angle) * serveSpeed,
     };
 
-    Object.values(this.paddles).forEach((paddle) => {
-      paddle.touchId = null;
-      paddle.vx = 0;
-      paddle.vy = 0;
-      paddle.grabOffsetX = 0;
-      paddle.grabOffsetY = 0;
-      paddle.body.setPosition(paddle.homeX, paddle.homeY);
-      paddle.glow.setPosition(paddle.homeX, paddle.homeY);
-      paddle.lastTargetX = paddle.homeX;
-      paddle.lastTargetY = paddle.homeY;
-    });
-
+    this.positionPaddlesAtHome();
     this.activePointerIds.clear();
   }
 
-  private clampPaddlePosition(paddle: PaddleState, x: number, y: number) {
-    const top = WORLD.inset + WORLD.paddleRadius;
-    const bottom = WORLD.height - WORLD.inset - WORLD.paddleRadius;
-    const centerGap = 110;
-    const leftBound = WORLD.inset + WORLD.paddleRadius;
-    const rightBound = WORLD.width - WORLD.inset - WORLD.paddleRadius;
+  private positionPaddlesAtHome() {
+    const l = this.layout;
+    const offset = Math.min(l.width, l.height) * 0.24;
 
-    const isLeftSide = paddle.half === 'left';
-    const minX = isLeftSide ? leftBound : WORLD.width / 2 + centerGap;
-    const maxX = isLeftSide ? WORLD.width / 2 - centerGap : rightBound;
+    if (l.divideVertical) {
+      this.setPaddleHome(this.paddles.a, l.centerX - offset, l.centerY);
+      this.setPaddleHome(this.paddles.b, l.centerX + offset, l.centerY);
+    } else {
+      this.setPaddleHome(this.paddles.a, l.centerX, l.centerY - offset);
+      this.setPaddleHome(this.paddles.b, l.centerX, l.centerY + offset);
+    }
+  }
 
-    return {
-      x: Phaser.Math.Clamp(x, minX, maxX),
-      y: Phaser.Math.Clamp(y, top, bottom),
-    };
+  private setPaddleHome(paddle: PaddleState, x: number, y: number) {
+    paddle.touchId = null;
+    paddle.vx = 0;
+    paddle.vy = 0;
+    paddle.grabOffsetX = 0;
+    paddle.grabOffsetY = 0;
+    paddle.homeX = x;
+    paddle.homeY = y;
+    paddle.body.setPosition(x, y);
+    paddle.glow.setPosition(x, y);
+    paddle.lastTargetX = x;
+    paddle.lastTargetY = y;
+  }
+
+  private clampPaddlePosition(player: 'a' | 'b', x: number, y: number) {
+    const l = this.layout;
+    const centerGap = Math.min(l.width, l.height) * 0.1;
+    const left = l.inset + l.paddleRadius;
+    const right = l.width - l.inset - l.paddleRadius;
+    const top = l.inset + l.paddleRadius;
+    const bottom = l.height - l.inset - l.paddleRadius;
+
+    if (l.divideVertical) {
+      const minX = player === 'a' ? left : l.centerX + centerGap;
+      const maxX = player === 'a' ? l.centerX - centerGap : right;
+      return { x: Phaser.Math.Clamp(x, minX, maxX), y: Phaser.Math.Clamp(y, top, bottom) };
+    }
+
+    const minY = player === 'a' ? top : l.centerY + centerGap;
+    const maxY = player === 'a' ? l.centerY - centerGap : bottom;
+    return { x: Phaser.Math.Clamp(x, left, right), y: Phaser.Math.Clamp(y, minY, maxY) };
   }
 
   private drawRink() {
     const g = this.rink;
+    const l = this.layout;
     g.clear();
 
     g.fillStyle(0x081629, 0.78);
-    g.fillRoundedRect(WORLD.inset, WORLD.inset, WORLD.width - WORLD.inset * 2, WORLD.height - WORLD.inset * 2, 42);
+    g.fillRoundedRect(l.inset, l.inset, l.width - l.inset * 2, l.height - l.inset * 2, 42);
 
     g.lineStyle(8, 0x7fd6ff, 0.95);
-    g.strokeRoundedRect(WORLD.inset, WORLD.inset, WORLD.width - WORLD.inset * 2, WORLD.height - WORLD.inset * 2, 42);
+    g.strokeRoundedRect(l.inset, l.inset, l.width - l.inset * 2, l.height - l.inset * 2, 42);
 
     g.lineStyle(4, 0xb968ff, 0.6);
-    g.strokeCircle(WORLD.width / 2, WORLD.height / 2, 180);
+    g.strokeCircle(l.centerX, l.centerY, Math.min(l.width, l.height) * 0.17);
 
     g.lineStyle(6, 0x75cfff, 0.4);
-    g.lineBetween(WORLD.width / 2, WORLD.inset + 28, WORLD.width / 2, WORLD.height - WORLD.inset - 28);
-
-    const goalTop = (WORLD.height - WORLD.goalWidth) / 2;
-    g.fillStyle(0x173455, 0.95);
-    g.fillRect(WORLD.inset, goalTop, WORLD.goalDepth, WORLD.goalWidth);
-    g.fillRect(WORLD.width - WORLD.inset - WORLD.goalDepth, goalTop, WORLD.goalDepth, WORLD.goalWidth);
-
-    g.lineStyle(6, 0xffffff, 0.4);
-    g.strokeRect(WORLD.inset, goalTop, WORLD.goalDepth, WORLD.goalWidth);
-    g.strokeRect(WORLD.width - WORLD.inset - WORLD.goalDepth, goalTop, WORLD.goalDepth, WORLD.goalWidth);
+    if (l.divideVertical) {
+      g.lineBetween(l.centerX, l.inset + 28, l.centerX, l.height - l.inset - 28);
+      const goalTop = l.centerY - l.goalLength / 2;
+      g.fillStyle(0x173455, 0.95);
+      g.fillRect(l.inset, goalTop, l.goalDepth, l.goalLength);
+      g.fillRect(l.width - l.inset - l.goalDepth, goalTop, l.goalDepth, l.goalLength);
+      g.lineStyle(6, 0xffffff, 0.4);
+      g.strokeRect(l.inset, goalTop, l.goalDepth, l.goalLength);
+      g.strokeRect(l.width - l.inset - l.goalDepth, goalTop, l.goalDepth, l.goalLength);
+    } else {
+      g.lineBetween(l.inset + 28, l.centerY, l.width - l.inset - 28, l.centerY);
+      const goalLeft = l.centerX - l.goalLength / 2;
+      g.fillStyle(0x173455, 0.95);
+      g.fillRect(goalLeft, l.inset, l.goalLength, l.goalDepth);
+      g.fillRect(goalLeft, l.height - l.inset - l.goalDepth, l.goalLength, l.goalDepth);
+      g.lineStyle(6, 0xffffff, 0.4);
+      g.strokeRect(goalLeft, l.inset, l.goalLength, l.goalDepth);
+      g.strokeRect(goalLeft, l.height - l.inset - l.goalDepth, l.goalLength, l.goalDepth);
+    }
   }
 
   private toggleMenu(show: boolean) {
@@ -600,13 +707,55 @@ class AirpuckScene extends Phaser.Scene {
     this.menuContainer.setVisible(show);
   }
 
-  private handleResize() {
-    const canvas = this.game.canvas;
-    canvas.style.width = '';
-    canvas.style.height = '';
-    canvas.style.maxWidth = '100vw';
-    canvas.style.maxHeight = '100vh';
-    this.scale.refresh();
+  private relayout(width: number, height: number) {
+    this.layout = this.makeLayout(width, height);
+    const l = this.layout;
+
+    this.cameras.main.setViewport(0, 0, width, height);
+    this.cameras.main.setScroll(0, 0);
+    this.cameras.main.setZoom(1);
+
+    this.stars.forEach((star) => {
+      if (star.x === 0 && star.y === 0) {
+        star.setPosition(Phaser.Math.Between(0, l.width), Phaser.Math.Between(0, l.height));
+      } else {
+        star.x = Phaser.Math.Wrap(star.x, 0, l.width);
+        star.y = Phaser.Math.Wrap(star.y, 0, l.height);
+      }
+    });
+
+    this.puck.setRadius(l.puckRadius);
+    this.puckGlow.setRadius(l.puckRadius * 2.2);
+    Object.values(this.paddles).forEach((paddle) => {
+      paddle.body.setRadius(l.paddleRadius);
+      paddle.glow.setRadius(l.paddleRadius * 1.45);
+    });
+
+    this.positionPaddlesAtHome();
+    this.puck.setPosition(l.centerX, l.centerY);
+    this.puckGlow.setPosition(l.centerX, l.centerY);
+
+    this.scoreText.setPosition(l.centerX, l.centerY).setFontSize(Math.max(40, Math.round(Math.min(l.width, l.height) * 0.066)));
+    this.subtitleText
+      .setPosition(l.centerX, l.centerY + Math.min(l.width, l.height) * 0.08)
+      .setFontSize(Math.max(18, Math.round(Math.min(l.width, l.height) * 0.028)));
+
+    this.fullscreenButton.setPosition(l.centerX, l.height - Math.max(50, l.inset + 18));
+
+    const panel = this.menuContainer.list[0] as Phaser.GameObjects.Rectangle;
+    const title = this.menuContainer.list[1] as Phaser.GameObjects.Text;
+    const restartBtn = this.menuContainer.list[2] as Phaser.GameObjects.Container;
+    const closeBtn = this.menuContainer.list[3] as Phaser.GameObjects.Container;
+    panel.setPosition(l.centerX, l.centerY).setSize(Math.min(560, l.width * 0.72), Math.min(380, l.height * 0.5));
+    title.setPosition(l.centerX, l.centerY - 110);
+    restartBtn.setPosition(l.centerX, l.centerY + 10);
+    closeBtn.setPosition(l.centerX, l.centerY + 110);
+
+    this.updateScoreText();
+  }
+
+  private handleResize(gameSize: Phaser.Structs.Size) {
+    this.relayout(gameSize.width, gameSize.height);
   }
 
   private async enterFullscreen() {
@@ -615,7 +764,7 @@ class AirpuckScene extends Phaser.Scene {
         await document.documentElement.requestFullscreen();
       }
     } catch {
-      // Some mobile browsers only partially support the standard fullscreen API.
+      // Mobile browsers vary here.
     }
 
     try {
@@ -624,7 +773,7 @@ class AirpuckScene extends Phaser.Scene {
         await orientation.lock('landscape-primary');
       }
     } catch {
-      // Orientation lock often requires fullscreen and may still fail on iOS.
+      // Optional enhancement only.
     }
 
     this.fullscreenButton.setVisible(false);
@@ -637,10 +786,10 @@ const game = new Phaser.Game({
   parent: 'app',
   backgroundColor: '#050816',
   scale: {
-    mode: Phaser.Scale.FIT,
+    mode: Phaser.Scale.RESIZE,
     autoCenter: Phaser.Scale.CENTER_BOTH,
-    width: WORLD.width,
-    height: WORLD.height,
+    width: window.innerWidth,
+    height: window.innerHeight,
   },
   scene: [AirpuckScene],
   render: {
@@ -653,4 +802,6 @@ const game = new Phaser.Game({
   },
 });
 
-window.addEventListener('resize', () => game.scale.refresh());
+window.addEventListener('resize', () => {
+  game.scale.resize(window.innerWidth, window.innerHeight);
+});
