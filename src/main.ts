@@ -3,8 +3,10 @@ import './style.css';
 
 type Vec2 = { x: number; y: number };
 
+type PaddleId = 'left' | 'right';
+
 type PaddleState = {
-  id: 'top' | 'bottom';
+  id: PaddleId;
   body: Phaser.GameObjects.Arc;
   glow: Phaser.GameObjects.Arc;
   vx: number;
@@ -12,13 +14,27 @@ type PaddleState = {
   touchId: number | null;
   homeX: number;
   homeY: number;
-  color: number;
-  half: 'top' | 'bottom';
+  half: PaddleId;
+  grabOffsetX: number;
+  grabOffsetY: number;
+  lastTargetX: number;
+  lastTargetY: number;
 };
 
 type ScoreState = {
-  top: number;
-  bottom: number;
+  left: number;
+  right: number;
+};
+
+type FireworkParticle = {
+  x: number;
+  y: number;
+  vx: number;
+  vy: number;
+  life: number;
+  maxLife: number;
+  color: number;
+  size: number;
 };
 
 const WORLD = {
@@ -39,6 +55,8 @@ const WORLD = {
   puckMinSpeed: 320,
   puckMaxSpeed: 3000,
   puckServeSpeed: 980,
+  goalPauseMs: 1350,
+  touchSmoothing: 0.34,
 };
 
 class AirpuckScene extends Phaser.Scene {
@@ -47,14 +65,19 @@ class AirpuckScene extends Phaser.Scene {
   private puck!: Phaser.GameObjects.Arc;
   private puckGlow!: Phaser.GameObjects.Arc;
   private puckTrail!: Phaser.GameObjects.Graphics;
-  private paddles!: Record<'top' | 'bottom', PaddleState>;
-  private score: ScoreState = { top: 0, bottom: 0 };
+  private fireworksGraphics!: Phaser.GameObjects.Graphics;
+  private paddles!: Record<PaddleId, PaddleState>;
+  private score: ScoreState = { left: 0, right: 0 };
   private scoreText!: Phaser.GameObjects.Text;
+  private subtitleText!: Phaser.GameObjects.Text;
   private menuContainer!: Phaser.GameObjects.Container;
+  private fullscreenButton!: Phaser.GameObjects.Container;
   private menuVisible = false;
+  private goalFreeze = false;
   private activePointerIds = new Set<number>();
   private puckVelocity: Vec2 = { x: 0, y: 0 };
   private puckLastPositions: Vec2[] = [];
+  private fireworks: FireworkParticle[] = [];
 
   constructor() {
     super('airpuck');
@@ -69,8 +92,7 @@ class AirpuckScene extends Phaser.Scene {
     this.registerInput();
     this.scale.on('resize', this.handleResize, this);
     this.handleResize();
-    this.resetRound(Phaser.Math.Between(0, 1) === 0 ? 'top' : 'bottom');
-    this.tryEnterFullscreen();
+    this.resetRound(Phaser.Math.Between(0, 1) === 0 ? 'left' : 'right');
   }
 
   private createBackdrop() {
@@ -93,6 +115,7 @@ class AirpuckScene extends Phaser.Scene {
   private createRink() {
     this.rink = this.add.graphics();
     this.puckTrail = this.add.graphics();
+    this.fireworksGraphics = this.add.graphics();
   }
 
   private createEntities() {
@@ -100,15 +123,16 @@ class AirpuckScene extends Phaser.Scene {
     this.puck = this.add.circle(WORLD.width / 2, WORLD.height / 2, WORLD.puckRadius, 0xe8f7ff, 1);
 
     this.paddles = {
-      top: this.createPaddle('top', 320, WORLD.height / 2, 0xff6bd6),
-      bottom: this.createPaddle('bottom', WORLD.width - 320, WORLD.height / 2, 0x69f0ff),
+      left: this.createPaddle('left', 320, WORLD.height / 2, 0xff6bd6),
+      right: this.createPaddle('right', WORLD.width - 320, WORLD.height / 2, 0x69f0ff),
     };
   }
 
-  private createPaddle(id: 'top' | 'bottom', x: number, y: number, color: number): PaddleState {
+  private createPaddle(id: PaddleId, x: number, y: number, color: number): PaddleState {
     const glow = this.add.circle(x, y, WORLD.paddleRadius * 1.45, color, 0.15);
     const body = this.add.circle(x, y, WORLD.paddleRadius, color, 1);
     body.setStrokeStyle(6, 0xffffff, 0.7);
+
     return {
       id,
       body,
@@ -118,8 +142,11 @@ class AirpuckScene extends Phaser.Scene {
       touchId: null,
       homeX: x,
       homeY: y,
-      color,
       half: id,
+      grabOffsetX: 0,
+      grabOffsetY: 0,
+      lastTargetX: x,
+      lastTargetY: y,
     };
   }
 
@@ -136,13 +163,18 @@ class AirpuckScene extends Phaser.Scene {
       .setOrigin(0.5)
       .setInteractive({ useHandCursor: true });
 
-    this.add
-      .text(WORLD.width / 2, WORLD.height / 2 + 86, 'Tap score to restart', {
+    this.subtitleText = this.add
+      .text(WORLD.width / 2, WORLD.height / 2 + 86, 'Tap score to restart • Tap FULLSCREEN for mobile', {
         fontFamily: 'Arial, Helvetica, sans-serif',
         fontSize: '30px',
         color: '#8fb6d9',
       })
       .setOrigin(0.5);
+
+    this.fullscreenButton = this.makeMenuButton(WORLD.width / 2, WORLD.height - 86, 'FULLSCREEN', () => {
+      void this.enterFullscreen();
+    }, 340);
+    this.fullscreenButton.setDepth(10);
 
     const panel = this.add.rectangle(WORLD.width / 2, WORLD.height / 2, 560, 380, 0x081120, 0.92);
     panel.setStrokeStyle(4, 0x69f0ff, 0.6);
@@ -157,10 +189,12 @@ class AirpuckScene extends Phaser.Scene {
       .setOrigin(0.5);
 
     const restartBtn = this.makeMenuButton(WORLD.width / 2, WORLD.height / 2 + 10, 'Restart', () => {
-      this.score = { top: 0, bottom: 0 };
+      this.score = { left: 0, right: 0 };
       this.updateScoreText();
       this.toggleMenu(false);
-      this.resetRound('bottom');
+      this.goalFreeze = false;
+      this.fireworks = [];
+      this.resetRound('right');
     });
 
     const closeBtn = this.makeMenuButton(WORLD.width / 2, WORLD.height / 2 + 110, 'Resume', () => {
@@ -169,12 +203,13 @@ class AirpuckScene extends Phaser.Scene {
 
     this.menuContainer = this.add.container(0, 0, [panel, title, restartBtn, closeBtn]);
     this.menuContainer.setVisible(false);
+    this.menuContainer.setDepth(20);
 
     this.scoreText.on('pointerdown', () => this.toggleMenu(true));
   }
 
-  private makeMenuButton(x: number, y: number, label: string, onClick: () => void) {
-    const bg = this.add.rectangle(x, y, 280, 72, 0x11213a, 0.95).setStrokeStyle(3, 0xc6efff, 0.55);
+  private makeMenuButton(x: number, y: number, label: string, onClick: () => void, width = 280) {
+    const bg = this.add.rectangle(x, y, width, 72, 0x11213a, 0.95).setStrokeStyle(3, 0xc6efff, 0.55);
     const text = this.add
       .text(x, y, label, {
         fontFamily: 'Arial, Helvetica, sans-serif',
@@ -182,8 +217,11 @@ class AirpuckScene extends Phaser.Scene {
         color: '#f3fbff',
       })
       .setOrigin(0.5);
+
     bg.setInteractive({ useHandCursor: true });
+    text.setInteractive({ useHandCursor: true });
     bg.on('pointerdown', onClick);
+    text.on('pointerdown', onClick);
     return this.add.container(0, 0, [bg, text]);
   }
 
@@ -196,7 +234,7 @@ class AirpuckScene extends Phaser.Scene {
   }
 
   private onPointerDown(pointer: Phaser.Input.Pointer) {
-    if (this.menuVisible) return;
+    if (this.menuVisible || this.goalFreeze) return;
     if (this.activePointerIds.size >= WORLD.maxTouches) return;
     if (this.activePointerIds.has(pointer.id)) return;
 
@@ -210,40 +248,57 @@ class AirpuckScene extends Phaser.Scene {
     }, available[0]);
 
     nearest.touchId = pointer.id;
+    nearest.grabOffsetX = nearest.body.x - pointer.worldX;
+    nearest.grabOffsetY = nearest.body.y - pointer.worldY;
+    nearest.lastTargetX = nearest.body.x;
+    nearest.lastTargetY = nearest.body.y;
     this.activePointerIds.add(pointer.id);
-    this.movePaddleToPointer(nearest, pointer, 0.016);
+    this.movePaddleToPointer(nearest, pointer, 1 / 60, true);
   }
 
   private onPointerMove(pointer: Phaser.Input.Pointer) {
     if (!this.activePointerIds.has(pointer.id)) return;
     const paddle = Object.values(this.paddles).find((p) => p.touchId === pointer.id);
     if (!paddle) return;
-    const dt = Math.max(pointer.event?.timeStamp ? 0.001 : 0.016, 0.016);
-    this.movePaddleToPointer(paddle, pointer, dt);
+    this.movePaddleToPointer(paddle, pointer, 1 / 60, false);
   }
 
   private onPointerUp(pointer: Phaser.Input.Pointer) {
     const paddle = Object.values(this.paddles).find((p) => p.touchId === pointer.id);
     if (!paddle) return;
     paddle.touchId = null;
+    paddle.grabOffsetX = 0;
+    paddle.grabOffsetY = 0;
     this.activePointerIds.delete(pointer.id);
   }
 
-  private movePaddleToPointer(paddle: PaddleState, pointer: Phaser.Input.Pointer, dt: number) {
-    const target = this.clampPaddlePosition(paddle, pointer.worldX, pointer.worldY);
+  private movePaddleToPointer(paddle: PaddleState, pointer: Phaser.Input.Pointer, dt: number, snap: boolean) {
+    const rawTargetX = pointer.worldX + paddle.grabOffsetX;
+    const rawTargetY = pointer.worldY + paddle.grabOffsetY;
+    const clamped = this.clampPaddlePosition(paddle, rawTargetX, rawTargetY);
+    const target = snap
+      ? clamped
+      : {
+          x: Phaser.Math.Linear(paddle.lastTargetX, clamped.x, WORLD.touchSmoothing),
+          y: Phaser.Math.Linear(paddle.lastTargetY, clamped.y, WORLD.touchSmoothing),
+        };
+
     paddle.vx = Phaser.Math.Clamp((target.x - paddle.body.x) / dt, -WORLD.paddleSpeedClamp, WORLD.paddleSpeedClamp);
     paddle.vy = Phaser.Math.Clamp((target.y - paddle.body.y) / dt, -WORLD.paddleSpeedClamp, WORLD.paddleSpeedClamp);
     paddle.body.setPosition(target.x, target.y);
     paddle.glow.setPosition(target.x, target.y);
+    paddle.lastTargetX = target.x;
+    paddle.lastTargetY = target.y;
   }
 
   update(time: number, delta: number) {
     const dt = Math.min(delta / 1000, 0.025);
     this.animateBackdrop(time);
     this.updatePaddles(dt);
-    if (!this.menuVisible) {
+    if (!this.menuVisible && !this.goalFreeze) {
       this.updatePuck(dt);
     }
+    this.updateFireworks(dt);
     this.drawRink();
     this.drawTrail();
   }
@@ -264,6 +319,8 @@ class AirpuckScene extends Phaser.Scene {
         paddle.vy = (nextY - paddle.body.y) / Math.max(dt, 0.001);
         paddle.body.setPosition(nextX, nextY);
         paddle.glow.setPosition(nextX, nextY);
+        paddle.lastTargetX = nextX;
+        paddle.lastTargetY = nextY;
       }
     });
   }
@@ -306,8 +363,8 @@ class AirpuckScene extends Phaser.Scene {
     this.puck.setPosition(nextX, nextY);
     this.puckGlow.setPosition(nextX, nextY);
 
-    this.resolvePaddleCollision(this.paddles.top);
-    this.resolvePaddleCollision(this.paddles.bottom);
+    this.resolvePaddleCollision(this.paddles.left);
+    this.resolvePaddleCollision(this.paddles.right);
 
     const speed = Math.hypot(this.puckVelocity.x, this.puckVelocity.y);
     if (speed < WORLD.puckMinSpeed && speed > 0) {
@@ -382,40 +439,116 @@ class AirpuckScene extends Phaser.Scene {
     const rightLine = WORLD.width - WORLD.inset - WORLD.goalDepth;
 
     if (this.puck.y > goalTop && this.puck.y < goalBottom && this.puck.x - WORLD.puckRadius <= leftLine) {
-      this.score.bottom += 1;
-      this.updateScoreText();
-      this.resetRound('top');
+      this.handleGoal('right');
       return;
     }
 
     if (this.puck.y > goalTop && this.puck.y < goalBottom && this.puck.x + WORLD.puckRadius >= rightLine) {
-      this.score.top += 1;
-      this.updateScoreText();
-      this.resetRound('bottom');
+      this.handleGoal('left');
     }
   }
 
-  private updateScoreText() {
-    this.scoreText.setText(`${this.score.top}  :  ${this.score.bottom}`);
+  private handleGoal(scoringSide: PaddleId) {
+    if (this.goalFreeze) return;
+
+    this.goalFreeze = true;
+    this.activePointerIds.clear();
+    Object.values(this.paddles).forEach((paddle) => {
+      paddle.touchId = null;
+      paddle.grabOffsetX = 0;
+      paddle.grabOffsetY = 0;
+    });
+
+    if (scoringSide === 'left') {
+      this.score.left += 1;
+      this.spawnFireworks(WORLD.inset + WORLD.goalDepth + 70, WORLD.height / 2, 0xff6bd6);
+    } else {
+      this.score.right += 1;
+      this.spawnFireworks(WORLD.width - WORLD.inset - WORLD.goalDepth - 70, WORLD.height / 2, 0x69f0ff);
+    }
+
+    this.updateScoreText();
+    this.subtitleText.setText('GOAL! Cosmic fireworks...');
+    this.puckVelocity = { x: 0, y: 0 };
+
+    this.time.delayedCall(WORLD.goalPauseMs, () => {
+      this.goalFreeze = false;
+      this.subtitleText.setText('Tap score to restart • Tap FULLSCREEN for mobile');
+      this.resetRound(scoringSide === 'left' ? 'right' : 'left');
+    });
   }
 
-  private resetRound(servingTo: 'top' | 'bottom') {
+  private spawnFireworks(x: number, y: number, baseColor: number) {
+    const palette = [baseColor, 0xffffff, 0x7fd6ff, 0xb968ff, 0xffde59];
+    for (let burst = 0; burst < 3; burst += 1) {
+      const burstAngle = Phaser.Math.FloatBetween(0, Math.PI * 2);
+      const burstX = x + Math.cos(burstAngle) * Phaser.Math.Between(10, 70);
+      const burstY = y + Math.sin(burstAngle) * Phaser.Math.Between(10, 120);
+      for (let i = 0; i < 26; i += 1) {
+        const angle = (Math.PI * 2 * i) / 26 + Phaser.Math.FloatBetween(-0.15, 0.15);
+        const speed = Phaser.Math.Between(180, 520);
+        this.fireworks.push({
+          x: burstX,
+          y: burstY,
+          vx: Math.cos(angle) * speed,
+          vy: Math.sin(angle) * speed,
+          life: Phaser.Math.FloatBetween(0.55, 1.15),
+          maxLife: 1.15,
+          color: palette[Phaser.Math.Between(0, palette.length - 1)],
+          size: Phaser.Math.FloatBetween(3, 8),
+        });
+      }
+    }
+  }
+
+  private updateFireworks(dt: number) {
+    this.fireworksGraphics.clear();
+    const next: FireworkParticle[] = [];
+
+    this.fireworks.forEach((particle) => {
+      particle.life -= dt;
+      if (particle.life <= 0) return;
+      particle.x += particle.vx * dt;
+      particle.y += particle.vy * dt;
+      particle.vx *= 0.985;
+      particle.vy *= 0.985;
+      particle.size *= 0.992;
+      const alpha = particle.life / particle.maxLife;
+      this.fireworksGraphics.fillStyle(particle.color, alpha);
+      this.fireworksGraphics.fillCircle(particle.x, particle.y, particle.size);
+      next.push(particle);
+    });
+
+    this.fireworks = next;
+  }
+
+  private updateScoreText() {
+    this.scoreText.setText(`${this.score.left}  :  ${this.score.right}`);
+  }
+
+  private resetRound(servingTo: PaddleId) {
     this.puck.setPosition(WORLD.width / 2, WORLD.height / 2);
     this.puckGlow.setPosition(WORLD.width / 2, WORLD.height / 2);
     this.puckLastPositions = [];
-    const angleBase = servingTo === 'top' ? 0 : Math.PI;
+    const angleBase = servingTo === 'left' ? 0 : Math.PI;
     const angle = angleBase + Phaser.Math.FloatBetween(-0.35, 0.35);
     this.puckVelocity = {
       x: Math.cos(angle) * WORLD.puckServeSpeed,
       y: Math.sin(angle) * WORLD.puckServeSpeed,
     };
+
     Object.values(this.paddles).forEach((paddle) => {
       paddle.touchId = null;
       paddle.vx = 0;
       paddle.vy = 0;
+      paddle.grabOffsetX = 0;
+      paddle.grabOffsetY = 0;
       paddle.body.setPosition(paddle.homeX, paddle.homeY);
       paddle.glow.setPosition(paddle.homeX, paddle.homeY);
+      paddle.lastTargetX = paddle.homeX;
+      paddle.lastTargetY = paddle.homeY;
     });
+
     this.activePointerIds.clear();
   }
 
@@ -426,7 +559,7 @@ class AirpuckScene extends Phaser.Scene {
     const leftBound = WORLD.inset + WORLD.paddleRadius;
     const rightBound = WORLD.width - WORLD.inset - WORLD.paddleRadius;
 
-    const isLeftSide = paddle.half === 'top';
+    const isLeftSide = paddle.half === 'left';
     const minX = isLeftSide ? leftBound : WORLD.width / 2 + centerGap;
     const maxX = isLeftSide ? WORLD.width / 2 - centerGap : rightBound;
 
@@ -469,31 +602,33 @@ class AirpuckScene extends Phaser.Scene {
 
   private handleResize() {
     const canvas = this.game.canvas;
-    canvas.style.width = '100vw';
-    canvas.style.height = '100vh';
+    canvas.style.width = '';
+    canvas.style.height = '';
+    canvas.style.maxWidth = '100vw';
+    canvas.style.maxHeight = '100vh';
+    this.scale.refresh();
   }
 
-  private async tryEnterFullscreen() {
-    const start = async () => {
-      try {
-        if (document.fullscreenElement == null) {
-          await document.documentElement.requestFullscreen();
-        }
-      } catch {
-        // Ignore blocked fullscreen attempts; user can still play.
+  private async enterFullscreen() {
+    try {
+      if (document.fullscreenElement == null) {
+        await document.documentElement.requestFullscreen();
       }
+    } catch {
+      // Some mobile browsers only partially support the standard fullscreen API.
+    }
 
-      try {
-        const orientation = screen.orientation as ScreenOrientation & { lock?: (orientation: string) => Promise<void> };
-        if (orientation?.lock) {
-          await orientation.lock('landscape-primary');
-        }
-      } catch {
-        // Orientation lock may not be allowed on all devices.
+    try {
+      const orientation = screen.orientation as ScreenOrientation & { lock?: (orientation: string) => Promise<void> };
+      if (orientation?.lock) {
+        await orientation.lock('landscape-primary');
       }
-    };
+    } catch {
+      // Orientation lock often requires fullscreen and may still fail on iOS.
+    }
 
-    window.addEventListener('pointerdown', start, { once: true });
+    this.fullscreenButton.setVisible(false);
+    this.subtitleText.setText('Tap score to restart');
   }
 }
 
