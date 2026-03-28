@@ -119,7 +119,7 @@ class AirpuckScene extends Phaser.Scene {
     const safeHeight = Math.max(height, 320);
     const shortSide = Math.min(safeWidth, safeHeight);
     const inset = Math.max(18, Math.round(shortSide * 0.05));
-    const goalLength = Math.round(shortSide * 0.2);
+    const goalLength = Math.round(shortSide * 0.25);
     const goalDepth = Math.max(14, Math.round(shortSide * 0.018));
     const paddleRadius = Math.max(38, Math.round(shortSide * 0.08));
     const puckRadius = Math.max(18, Math.round(shortSide * 0.036));
